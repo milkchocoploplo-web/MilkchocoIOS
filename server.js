@@ -1,4 +1,4 @@
-// server.js - MilkChoco Agent Manager (JSON file storage + スリープ対策)
+// server.js - MilkChoco Agent Manager (認証なし / JSON storage / スリープ対策)
 const express = require('express');
 const path = require('path');
 const https = require('https');
@@ -7,7 +7,6 @@ const fs = require('fs');
 const app = express();
 const port = process.env.PORT || 3000;
 
-const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || 'changeme';
 const SELF_URL = process.env.SELF_URL || `https://${process.env.RENDER_EXTERNAL_HOSTNAME || 'localhost'}`;
 const PING_INTERVAL_MS = 7 * 60 * 1000;
 
@@ -17,12 +16,8 @@ if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
 const DATA_FILE = path.join(DATA_DIR, 'scripts.json');
 
 // === インメモリDB ===
-let db = {
-    scripts: [],
-    nextId: 1
-};
+let db = { scripts: [], nextId: 1 };
 
-// 起動時にファイルから読み込み
 function loadDB() {
     try {
         if (fs.existsSync(DATA_FILE)) {
@@ -50,54 +45,16 @@ function saveDB() {
 app.use(express.json({ limit: '5mb' }));
 app.use(express.urlencoded({ extended: true, limit: '5mb' }));
 
-// === 認証 ===
-function requireAuth(req, res, next) {
-    const pwd = req.query.pwd || req.body.pwd;
-    if (pwd === ADMIN_PASSWORD) return next();
-    res.status(401).send(getLoginHTML('パスワードが違います'));
-}
-
-function getLoginHTML(error = '') {
-    return `<!DOCTYPE html>
-<html><head><meta charset="UTF-8"><title>Login</title>
-<style>
-body {font-family:sans-serif;background:#0d1117;color:#c9d1d9;padding:80px;text-align:center;}
-.card {background:#161b22;padding:30px;border-radius:15px;display:inline-block;border:1px solid #30363d;}
-input,button {padding:12px;margin:10px;width:280px;border:1px solid #30363d;border-radius:8px;background:#0d1117;color:#c9d1d9;}
-button {background:#f85149;color:white;font-weight:bold;cursor:pointer;border:none;}
-button:hover {background:#da3633;}
-.error {color:#f85149;font-weight:bold;}
-h2 {color:#f85149;}
-</style></head>
-<body><div class="card">
-<h2>MilkChoco Agent Manager</h2>
-<form method="POST" action="/login">
-<input type="password" name="pwd" placeholder="パスワード" required autofocus><br>
-<button type="submit">ログイン</button>
-</form>
-${error ? `<p class="error">${error}</p>` : ''}
-</div></body></html>`;
-}
-
-app.get('/', (req, res) => res.send(getLoginHTML()));
-app.post('/login', (req, res) => {
-    if (req.body.pwd === ADMIN_PASSWORD) {
-        res.redirect('/dashboard?pwd=' + encodeURIComponent(req.body.pwd));
-    } else {
-        res.send(getLoginHTML('パスワードが違います'));
-    }
-});
-
-app.get('/dashboard', requireAuth, (req, res) => {
+// === ダッシュボード ===
+app.get('/', (req, res) => {
     res.sendFile(path.join(__dirname, 'public', 'index.html'));
 });
 
 // === API: アップロード ===
-app.post('/api/upload', requireAuth, (req, res) => {
+app.post('/api/upload', (req, res) => {
     const { name, content } = req.body;
     if (!name || !content) return res.status(400).json({ error: "name and content required" });
 
-    // 全てのアクティブを解除
     db.scripts.forEach(s => s.is_active = false);
 
     const script = {
@@ -108,7 +65,7 @@ app.post('/api/upload', requireAuth, (req, res) => {
         is_active: true,
         created: new Date().toISOString()
     };
-    db.scripts.unshift(script);  // 新しいのを先頭に
+    db.scripts.unshift(script);
     saveDB();
 
     console.log(`[upload] id=${script.id} name=${name} size=${script.size}`);
@@ -116,7 +73,7 @@ app.post('/api/upload', requireAuth, (req, res) => {
 });
 
 // === API: 一覧 ===
-app.get('/api/list', requireAuth, (req, res) => {
+app.get('/api/list', (req, res) => {
     res.json({ scripts: db.scripts.map(s => ({
         id: s.id, name: s.name, size: s.size,
         is_active: s.is_active, created: s.created
@@ -124,7 +81,7 @@ app.get('/api/list', requireAuth, (req, res) => {
 });
 
 // === API: アクティブ切替 ===
-app.post('/api/activate/:id', requireAuth, (req, res) => {
+app.post('/api/activate/:id', (req, res) => {
     const id = parseInt(req.params.id);
     db.scripts.forEach(s => s.is_active = (s.id === id));
     saveDB();
@@ -133,7 +90,7 @@ app.post('/api/activate/:id', requireAuth, (req, res) => {
 });
 
 // === API: 削除 ===
-app.delete('/api/delete/:id', requireAuth, (req, res) => {
+app.delete('/api/delete/:id', (req, res) => {
     const id = parseInt(req.params.id);
     db.scripts = db.scripts.filter(s => s.id !== id);
     saveDB();
@@ -142,7 +99,7 @@ app.delete('/api/delete/:id', requireAuth, (req, res) => {
 });
 
 // === API: 個別表示 ===
-app.get('/api/script/:id', requireAuth, (req, res) => {
+app.get('/api/script/:id', (req, res) => {
     const id = parseInt(req.params.id);
     const s = db.scripts.find(x => x.id === id);
     if (!s) return res.status(404).json({ error: "not found" });
