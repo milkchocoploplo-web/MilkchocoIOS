@@ -1,6 +1,5 @@
-// server.js - MilkChoco Agent Manager (SQLite + スリープ対策)
+// server.js - MilkChoco Agent Manager (JSON file storage + スリープ対策)
 const express = require('express');
-const sqlite3 = require('sqlite3').verbose();
 const path = require('path');
 const https = require('https');
 const fs = require('fs');
@@ -8,38 +7,48 @@ const fs = require('fs');
 const app = express();
 const port = process.env.PORT || 3000;
 
-// === 設定 ===
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || 'changeme';
 const SELF_URL = process.env.SELF_URL || `https://${process.env.RENDER_EXTERNAL_HOSTNAME || 'localhost'}`;
-const PING_INTERVAL_MS = 7 * 60 * 1000;  // 7分
+const PING_INTERVAL_MS = 7 * 60 * 1000;
+
+// === データ保存先 ===
+const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, 'data');
+if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
+const DATA_FILE = path.join(DATA_DIR, 'scripts.json');
+
+// === インメモリDB ===
+let db = {
+    scripts: [],
+    nextId: 1
+};
+
+// 起動時にファイルから読み込み
+function loadDB() {
+    try {
+        if (fs.existsSync(DATA_FILE)) {
+            const raw = fs.readFileSync(DATA_FILE, 'utf8');
+            db = JSON.parse(raw);
+            console.log(`[db] loaded ${db.scripts.length} scripts`);
+        } else {
+            console.log('[db] fresh start');
+        }
+    } catch (e) {
+        console.error('[db] load error:', e.message);
+    }
+}
+loadDB();
+
+function saveDB() {
+    try {
+        fs.writeFileSync(DATA_FILE, JSON.stringify(db, null, 2));
+    } catch (e) {
+        console.error('[db] save error:', e.message);
+    }
+}
 
 // === ミドルウェア ===
 app.use(express.json({ limit: '5mb' }));
 app.use(express.urlencoded({ extended: true, limit: '5mb' }));
-app.use(express.text({ limit: '5mb', type: 'text/plain' }));
-
-// === DB ===
-// Render のディスクは再起動で消えるので /var/data を推奨
-const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, 'data');
-if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
-const dbPath = path.join(DATA_DIR, 'agent.db');
-const db = new sqlite3.Database(dbPath, (err) => {
-    if (err) console.error("DB接続失敗:", err);
-    else console.log(`DB接続: ${dbPath}`);
-});
-
-db.serialize(() => {
-    db.run(`
-        CREATE TABLE IF NOT EXISTS scripts (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT NOT NULL,
-            content TEXT NOT NULL,
-            size INTEGER NOT NULL,
-            is_active INTEGER DEFAULT 0,
-            created DATETIME DEFAULT CURRENT_TIMESTAMP
-        )
-    `);
-});
 
 // === 認証 ===
 function requireAuth(req, res, next) {
@@ -79,7 +88,6 @@ app.post('/login', (req, res) => {
     }
 });
 
-// === ダッシュボード ===
 app.get('/dashboard', requireAuth, (req, res) => {
     res.sendFile(path.join(__dirname, 'public', 'index.html'));
 });
@@ -88,85 +96,77 @@ app.get('/dashboard', requireAuth, (req, res) => {
 app.post('/api/upload', requireAuth, (req, res) => {
     const { name, content } = req.body;
     if (!name || !content) return res.status(400).json({ error: "name and content required" });
-    const size = Buffer.byteLength(content, 'utf8');
 
-    // 既存のアクティブを解除して、新規をアクティブに
-    db.serialize(() => {
-        db.run("UPDATE scripts SET is_active = 0");
-        db.run(
-            "INSERT INTO scripts (name, content, size, is_active) VALUES (?, ?, ?, 1)",
-            [name, content, size],
-            function(err) {
-                if (err) return res.status(500).json({ error: err.message });
-                console.log(`[upload] id=${this.lastID} name=${name} size=${size}`);
-                res.json({ ok: true, id: this.lastID });
-            }
-        );
-    });
+    // 全てのアクティブを解除
+    db.scripts.forEach(s => s.is_active = false);
+
+    const script = {
+        id: db.nextId++,
+        name,
+        content,
+        size: Buffer.byteLength(content, 'utf8'),
+        is_active: true,
+        created: new Date().toISOString()
+    };
+    db.scripts.unshift(script);  // 新しいのを先頭に
+    saveDB();
+
+    console.log(`[upload] id=${script.id} name=${name} size=${script.size}`);
+    res.json({ ok: true, id: script.id });
 });
 
 // === API: 一覧 ===
 app.get('/api/list', requireAuth, (req, res) => {
-    db.all(
-        "SELECT id, name, size, is_active, created FROM scripts ORDER BY created DESC",
-        (err, rows) => {
-            if (err) return res.status(500).json({ error: err.message });
-            res.json({ scripts: rows || [] });
-        }
-    );
+    res.json({ scripts: db.scripts.map(s => ({
+        id: s.id, name: s.name, size: s.size,
+        is_active: s.is_active, created: s.created
+    }))});
 });
 
 // === API: アクティブ切替 ===
 app.post('/api/activate/:id', requireAuth, (req, res) => {
     const id = parseInt(req.params.id);
-    db.serialize(() => {
-        db.run("UPDATE scripts SET is_active = 0");
-        db.run("UPDATE scripts SET is_active = 1 WHERE id = ?", [id], (err) => {
-            if (err) return res.status(500).json({ error: err.message });
-            console.log(`[activate] id=${id}`);
-            res.json({ ok: true });
-        });
-    });
+    db.scripts.forEach(s => s.is_active = (s.id === id));
+    saveDB();
+    console.log(`[activate] id=${id}`);
+    res.json({ ok: true });
 });
 
 // === API: 削除 ===
 app.delete('/api/delete/:id', requireAuth, (req, res) => {
     const id = parseInt(req.params.id);
-    db.run("DELETE FROM scripts WHERE id = ?", [id], (err) => {
-        if (err) return res.status(500).json({ error: err.message });
-        console.log(`[delete] id=${id}`);
-        res.json({ ok: true });
-    });
+    db.scripts = db.scripts.filter(s => s.id !== id);
+    saveDB();
+    console.log(`[delete] id=${id}`);
+    res.json({ ok: true });
 });
 
 // === API: 個別表示 ===
 app.get('/api/script/:id', requireAuth, (req, res) => {
     const id = parseInt(req.params.id);
-    db.get("SELECT name, content FROM scripts WHERE id = ?", [id], (err, row) => {
-        if (err || !row) return res.status(404).json({ error: "not found" });
-        res.json(row);
-    });
+    const s = db.scripts.find(x => x.id === id);
+    if (!s) return res.status(404).json({ error: "not found" });
+    res.json({ name: s.name, content: s.content });
 });
 
-// === Frida Gadget が取得する agent.js（認証なし） ===
+// === Frida Gadget が取得する agent.js ===
 app.get('/agent.js', (req, res) => {
-    db.get("SELECT content FROM scripts WHERE is_active = 1 LIMIT 1", (err, row) => {
-        res.type('application/javascript');
-        if (err || !row) {
-            return res.send('console.log("[agent] no active script");');
-        }
-        console.log(`[agent.js] served at ${new Date().toISOString()}`);
-        res.send(row.content);
-    });
+    res.type('application/javascript');
+    const active = db.scripts.find(s => s.is_active);
+    if (!active) {
+        return res.send('console.log("[agent] no active script");');
+    }
+    console.log(`[agent.js] served "${active.name}" at ${new Date().toISOString()}`);
+    res.send(active.content);
 });
 
 // === ヘルスチェック ===
-app.get('/health', (req, res) => res.json({ ok: true, t: Date.now() }));
+app.get('/health', (req, res) => res.json({ ok: true, t: Date.now(), scripts: db.scripts.length }));
 
-// === スリープ防止（自己ping） ===
+// === スリープ防止 ===
 function startSelfPing() {
     if (!SELF_URL || SELF_URL.includes('localhost')) {
-        console.log('[self-ping] localhost のためスキップ');
+        console.log('[self-ping] skip (localhost)');
         return;
     }
     const pingUrl = `${SELF_URL}/health`;
