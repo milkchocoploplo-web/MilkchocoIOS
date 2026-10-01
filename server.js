@@ -1,139 +1,188 @@
-const express = require("express");
-const { Pool } = require("pg");
-const path = require("path");
+// server.js - MilkChoco Agent Manager (SQLite + スリープ対策)
+const express = require('express');
+const sqlite3 = require('sqlite3').verbose();
+const path = require('path');
+const https = require('https');
+const fs = require('fs');
 
 const app = express();
-const PORT = process.env.PORT || 3000;
+const port = process.env.PORT || 3000;
 
-// PostgreSQL 接続
-const pool = new Pool({
-    connectionString: process.env.DATABASE_URL,
-    ssl: process.env.DATABASE_URL && process.env.DATABASE_URL.includes("render.com")
-        ? { rejectUnauthorized: false }
-        : false
+// === 設定 ===
+const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || 'changeme';
+const SELF_URL = process.env.SELF_URL || `https://${process.env.RENDER_EXTERNAL_HOSTNAME || 'localhost'}`;
+const PING_INTERVAL_MS = 7 * 60 * 1000;  // 7分
+
+// === ミドルウェア ===
+app.use(express.json({ limit: '5mb' }));
+app.use(express.urlencoded({ extended: true, limit: '5mb' }));
+app.use(express.text({ limit: '5mb', type: 'text/plain' }));
+
+// === DB ===
+// Render のディスクは再起動で消えるので /var/data を推奨
+const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, 'data');
+if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
+const dbPath = path.join(DATA_DIR, 'agent.db');
+const db = new sqlite3.Database(dbPath, (err) => {
+    if (err) console.error("DB接続失敗:", err);
+    else console.log(`DB接続: ${dbPath}`);
 });
 
-// テーブル自動初期化
-async function initDB() {
-    await pool.query(`
+db.serialize(() => {
+    db.run(`
         CREATE TABLE IF NOT EXISTS scripts (
-            id SERIAL PRIMARY KEY,
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
             name TEXT NOT NULL,
             content TEXT NOT NULL,
-            created_at TIMESTAMP DEFAULT NOW(),
-            is_active BOOLEAN DEFAULT FALSE
-        );
+            size INTEGER NOT NULL,
+            is_active INTEGER DEFAULT 0,
+            created DATETIME DEFAULT CURRENT_TIMESTAMP
+        )
     `);
-    console.log("[db] initialized");
+});
+
+// === 認証 ===
+function requireAuth(req, res, next) {
+    const pwd = req.query.pwd || req.body.pwd;
+    if (pwd === ADMIN_PASSWORD) return next();
+    res.status(401).send(getLoginHTML('パスワードが違います'));
 }
-initDB().catch(e => console.error("[db] init failed:", e));
 
-// JSONボディ（1MBまで）
-app.use(express.json({ limit: "1mb" }));
-app.use(express.text({ limit: "1mb", type: "text/plain" }));
+function getLoginHTML(error = '') {
+    return `<!DOCTYPE html>
+<html><head><meta charset="UTF-8"><title>Login</title>
+<style>
+body {font-family:sans-serif;background:#0d1117;color:#c9d1d9;padding:80px;text-align:center;}
+.card {background:#161b22;padding:30px;border-radius:15px;display:inline-block;border:1px solid #30363d;}
+input,button {padding:12px;margin:10px;width:280px;border:1px solid #30363d;border-radius:8px;background:#0d1117;color:#c9d1d9;}
+button {background:#f85149;color:white;font-weight:bold;cursor:pointer;border:none;}
+button:hover {background:#da3633;}
+.error {color:#f85149;font-weight:bold;}
+h2 {color:#f85149;}
+</style></head>
+<body><div class="card">
+<h2>MilkChoco Agent Manager</h2>
+<form method="POST" action="/login">
+<input type="password" name="pwd" placeholder="パスワード" required autofocus><br>
+<button type="submit">ログイン</button>
+</form>
+${error ? `<p class="error">${error}</p>` : ''}
+</div></body></html>`;
+}
 
-// 静的ファイル（管理UI）
-app.use(express.static(path.join(__dirname, "public")));
+app.get('/', (req, res) => res.send(getLoginHTML()));
+app.post('/login', (req, res) => {
+    if (req.body.pwd === ADMIN_PASSWORD) {
+        res.redirect('/dashboard?pwd=' + encodeURIComponent(req.body.pwd));
+    } else {
+        res.send(getLoginHTML('パスワードが違います'));
+    }
+});
 
-// =============================================================
-//  アップロード
-// =============================================================
-app.post("/api/upload", async (req, res) => {
-    try {
-        const { name, content } = req.body;
-        if (!name || !content) return res.status(400).json({ error: "name and content required" });
+// === ダッシュボード ===
+app.get('/dashboard', requireAuth, (req, res) => {
+    res.sendFile(path.join(__dirname, 'public', 'index.html'));
+});
 
-        // 既存のアクティブを解除（新規アップは自動でアクティブに）
-        await pool.query("UPDATE scripts SET is_active = FALSE WHERE is_active = TRUE");
+// === API: アップロード ===
+app.post('/api/upload', requireAuth, (req, res) => {
+    const { name, content } = req.body;
+    if (!name || !content) return res.status(400).json({ error: "name and content required" });
+    const size = Buffer.byteLength(content, 'utf8');
 
-        const result = await pool.query(
-            "INSERT INTO scripts (name, content, is_active) VALUES ($1, $2, TRUE) RETURNING id, name, created_at",
-            [name, content]
+    // 既存のアクティブを解除して、新規をアクティブに
+    db.serialize(() => {
+        db.run("UPDATE scripts SET is_active = 0");
+        db.run(
+            "INSERT INTO scripts (name, content, size, is_active) VALUES (?, ?, ?, 1)",
+            [name, content, size],
+            function(err) {
+                if (err) return res.status(500).json({ error: err.message });
+                console.log(`[upload] id=${this.lastID} name=${name} size=${size}`);
+                res.json({ ok: true, id: this.lastID });
+            }
         );
-        res.json({ ok: true, script: result.rows[0] });
-    } catch (e) {
-        console.error(e);
-        res.status(500).json({ error: e.message });
-    }
+    });
 });
 
-// =============================================================
-//  一覧取得
-// =============================================================
-app.get("/api/list", async (req, res) => {
-    try {
-        const result = await pool.query(
-            "SELECT id, name, created_at, is_active, LENGTH(content) AS size FROM scripts ORDER BY created_at DESC"
-        );
-        res.json({ scripts: result.rows });
-    } catch (e) {
-        res.status(500).json({ error: e.message });
-    }
-});
-
-// =============================================================
-//  アクティブ切り替え
-// =============================================================
-app.post("/api/activate/:id", async (req, res) => {
-    try {
-        const id = parseInt(req.params.id);
-        await pool.query("UPDATE scripts SET is_active = FALSE");
-        await pool.query("UPDATE scripts SET is_active = TRUE WHERE id = $1", [id]);
-        res.json({ ok: true });
-    } catch (e) {
-        res.status(500).json({ error: e.message });
-    }
-});
-
-// =============================================================
-//  削除
-// =============================================================
-app.delete("/api/delete/:id", async (req, res) => {
-    try {
-        const id = parseInt(req.params.id);
-        await pool.query("DELETE FROM scripts WHERE id = $1", [id]);
-        res.json({ ok: true });
-    } catch (e) {
-        res.status(500).json({ error: e.message });
-    }
-});
-
-// =============================================================
-//  Frida Gadget が取得する agent.js
-// =============================================================
-app.get("/agent.js", async (req, res) => {
-    try {
-        const result = await pool.query(
-            "SELECT content FROM scripts WHERE is_active = TRUE LIMIT 1"
-        );
-        if (result.rows.length === 0) {
-            return res.type("application/javascript").send(
-                'console.log("[agent] no active script");'
-            );
+// === API: 一覧 ===
+app.get('/api/list', requireAuth, (req, res) => {
+    db.all(
+        "SELECT id, name, size, is_active, created FROM scripts ORDER BY created DESC",
+        (err, rows) => {
+            if (err) return res.status(500).json({ error: err.message });
+            res.json({ scripts: rows || [] });
         }
-        res.type("application/javascript").send(result.rows[0].content);
+    );
+});
+
+// === API: アクティブ切替 ===
+app.post('/api/activate/:id', requireAuth, (req, res) => {
+    const id = parseInt(req.params.id);
+    db.serialize(() => {
+        db.run("UPDATE scripts SET is_active = 0");
+        db.run("UPDATE scripts SET is_active = 1 WHERE id = ?", [id], (err) => {
+            if (err) return res.status(500).json({ error: err.message });
+            console.log(`[activate] id=${id}`);
+            res.json({ ok: true });
+        });
+    });
+});
+
+// === API: 削除 ===
+app.delete('/api/delete/:id', requireAuth, (req, res) => {
+    const id = parseInt(req.params.id);
+    db.run("DELETE FROM scripts WHERE id = ?", [id], (err) => {
+        if (err) return res.status(500).json({ error: err.message });
+        console.log(`[delete] id=${id}`);
+        res.json({ ok: true });
+    });
+});
+
+// === API: 個別表示 ===
+app.get('/api/script/:id', requireAuth, (req, res) => {
+    const id = parseInt(req.params.id);
+    db.get("SELECT name, content FROM scripts WHERE id = ?", [id], (err, row) => {
+        if (err || !row) return res.status(404).json({ error: "not found" });
+        res.json(row);
+    });
+});
+
+// === Frida Gadget が取得する agent.js（認証なし） ===
+app.get('/agent.js', (req, res) => {
+    db.get("SELECT content FROM scripts WHERE is_active = 1 LIMIT 1", (err, row) => {
+        res.type('application/javascript');
+        if (err || !row) {
+            return res.send('console.log("[agent] no active script");');
+        }
         console.log(`[agent.js] served at ${new Date().toISOString()}`);
-    } catch (e) {
-        res.type("application/javascript").send(
-            `console.log("[agent] error: ${e.message}");`
-        );
-    }
+        res.send(row.content);
+    });
 });
 
-// =============================================================
-//  個別バージョンの内容表示（プレビュー用）
-// =============================================================
-app.get("/api/script/:id", async (req, res) => {
-    try {
-        const id = parseInt(req.params.id);
-        const result = await pool.query("SELECT name, content FROM scripts WHERE id = $1", [id]);
-        if (result.rows.length === 0) return res.status(404).json({ error: "not found" });
-        res.json(result.rows[0]);
-    } catch (e) {
-        res.status(500).json({ error: e.message });
-    }
-});
+// === ヘルスチェック ===
+app.get('/health', (req, res) => res.json({ ok: true, t: Date.now() }));
 
-app.listen(PORT, () => {
-    console.log(`[*] server listening on port ${PORT}`);
+// === スリープ防止（自己ping） ===
+function startSelfPing() {
+    if (!SELF_URL || SELF_URL.includes('localhost')) {
+        console.log('[self-ping] localhost のためスキップ');
+        return;
+    }
+    const pingUrl = `${SELF_URL}/health`;
+    console.log(`[self-ping] start: ${pingUrl}`);
+    setInterval(() => {
+        https.get(pingUrl, (res) => {
+            console.log(`[self-ping] ${res.statusCode} ${new Date().toISOString()}`);
+            res.resume();
+        }).on('error', (err) => {
+            console.error(`[self-ping] error: ${err.message}`);
+        });
+    }, PING_INTERVAL_MS);
+}
+
+app.listen(port, () => {
+    console.log(`[*] listening on port ${port}`);
+    console.log(`[*] login: ${SELF_URL}/`);
+    startSelfPing();
 });
